@@ -1,0 +1,231 @@
+*******************************************
+1. Importing Required Libraries
+*******************************************
+
+import tensorflow as tf
+from tensorflow.keras.layers import Conv2D, BatchNormalization, PReLU, UpSampling2D, Dense, Flatten, Input, add
+from tensorflow.keras.models import Model
+from tensorflow.keras.applications import VGG19
+from tensorflow.keras.optimizers import Adam
+
+import numpy as np
+
+*******************************************
+2. Define Residual Block for the Generator
+*******************************************
+
+def residual_block(x):
+    res = Conv2D(64, kernel_size=3, strides=1, padding='same')(x)
+    res = BatchNormalization(momentum=0.8)(res)
+    res = PReLU(shared_axes=[1, 2])(res)
+    res = Conv2D(64, kernel_size=3, strides=1, padding='same')(res)
+    res = BatchNormalization(momentum=0.8)(res)
+    return add([x, res])
+
+*******************************************
+3. Build the Generator
+*******************************************
+
+def build_generator():
+    input_shape = (64, 64, 3)
+    inputs = Input(input_shape)
+
+    # First Convolutional Block
+    gen = Conv2D(64, kernel_size=9, strides=1, padding='same')(inputs)
+    gen = PReLU(shared_axes=[1, 2])(gen)
+
+    # Residual Blocks
+    res = residual_block(gen)
+    for _ in range(15):
+        res = residual_block(res)
+
+    # Second Convolutional Block
+    gen = Conv2D(64, kernel_size=3, strides=1, padding='same')(res)
+    gen = BatchNormalization(momentum=0.8)(gen)
+
+    # Upsampling Blocks
+    for _ in range(2):
+        gen = UpSampling2D(size=2)(gen)
+        gen = Conv2D(256, kernel_size=3, strides=1, padding='same')(gen)
+        gen = PReLU(shared_axes=[1, 2])(gen)
+
+    # Final Output Block
+    outputs = Conv2D(3, kernel_size=9, strides=1, padding='same', activation='tanh')(gen)
+
+    return Model(inputs, outputs)
+
+*******************************************
+4. Build the Discriminator
+*******************************************
+
+def build_discriminator():
+    input_shape = (256, 256, 3)
+    inputs = Input(input_shape)
+
+    disc = Conv2D(64, kernel_size=3, strides=1, padding='same')(inputs)
+    disc = PReLU(shared_axes=[1, 2])(disc)
+
+    disc = Conv2D(64, kernel_size=3, strides=2, padding='same')(disc)
+    disc = BatchNormalization(momentum=0.8)(disc)
+    disc = PReLU(shared_axes=[1, 2])(disc)
+
+    for filters in [128, 256, 512]:
+        disc = Conv2D(filters, kernel_size=3, strides=1, padding='same')(disc)
+        disc = BatchNormalization(momentum=0.8)(disc)
+        disc = PReLU(shared_axes=[1, 2])(disc)
+        
+        disc = Conv2D(filters, kernel_size=3, strides=2, padding='same')(disc)
+        disc = BatchNormalization(momentum=0.8)(disc)
+        disc = PReLU(shared_axes=[1, 2])(disc)
+
+    disc = Flatten()(disc)
+    disc = Dense(1024)(disc)
+    disc = PReLU()(disc)
+    outputs = Dense(1, activation='sigmoid')(disc)
+
+    return Model(inputs, outputs)
+
+*******************************************
+5. Define the VGG Loss
+*******************************************
+
+def build_vgg():
+    # include_top=False: I mean, I won't use the last layer that is in VGG, meaning I don't want the output of VGG, which is softmax. 
+    vgg = VGG19(weights="imagenet", include_top=False, input_shape=(256, 256, 3))
+    vgg.trainable = False
+    model = Model(inputs=vgg.input, outputs=vgg.get_layer("block5_conv4").output)
+    return model
+
+def vgg_loss(y_true, y_pred):
+    vgg = build_vgg()
+    return tf.keras.losses.MeanSquaredError()(vgg(y_true), vgg(y_pred))
+
+*******************************************
+6. Combine Generator and Discriminator
+*******************************************
+
+def build_combined(generator, discriminator, vgg):
+    discriminator.trainable = False
+    inputs = Input((64, 64, 3))
+    generated_img = generator(inputs)
+    validity = discriminator(generated_img)
+    features = vgg(generated_img)
+
+    return Model(inputs, [validity, features])
+
+*******************************************
+7. Compile Models
+*******************************************
+
+def compile_models(generator, discriminator, combined):
+    optimizer = Adam(0.0002, 0.5)
+
+    discriminator.compile(loss="binary_crossentropy", optimizer=optimizer, metrics=["accuracy"])
+
+    combined.compile(loss=["binary_crossentropy", vgg_loss], loss_weights=[1e-3, 1], optimizer=optimizer)
+
+*******************************************
+8. Training Loop
+*******************************************
+
+def train(generator, discriminator, combined, data_loader, epochs, batch_size):
+    for epoch in range(epochs):
+        for batch_i, (imgs_lr, imgs_hr) in enumerate(data_loader):
+            # Train Discriminator
+            fake_hr = generator.predict(imgs_lr)
+	    # valid, fake: labeling for real and fake
+            valid = np.ones((batch_size, 1))
+            fake = np.zeros((batch_size, 1))
+
+            d_loss_real = discriminator.train_on_batch(imgs_hr, valid)
+            d_loss_fake = discriminator.train_on_batch(fake_hr, fake)
+            d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
+
+            # Train Generator
+            g_loss = combined.train_on_batch(imgs_lr, [valid, imgs_hr])
+
+        print(f"Epoch: {epoch+1}, D Loss: {d_loss[0]}, G Loss: {g_loss[0]}")
+
+*******************************************
+9. Load Data and Start Training
+*******************************************
+
+# Assume `data_loader` yields low-res and high-res image pairs
+data_loader = ...
+epochs = 10000
+batch_size = 16
+
+generator = build_generator()
+discriminator = build_discriminator()
+vgg = build_vgg()
+
+combined = build_combined(generator, discriminator, vgg)
+compile_models(generator, discriminator, combined)
+
+train(generator, discriminator, combined, data_loader, epochs, batch_size)
+
+*********************************************************************************************************************************
+
+Explanation:
+Generator: Generates high-resolution images from low-resolution inputs.
+Discriminator: Differentiates between real and generated high-resolution images.
+VGG: Used for feature extraction in the perceptual loss (VGG loss).
+This is a simplified example and might need tuning or additional components (like better data augmentation, training strategies, or different loss functions) depending on your specific use case.
+
+*************************************************************************************************************************************************
+
+import os
+import glob
+
+list1 = ["Bad" , "Good"]
+list2 = ["Apple", "Banana" , "Guava", "Lemon", "Orange", "pomegranate"]
+
+folder_path = f"/content/dataset/fruit-quality-classification/Mixed Qualit_Fruits/Pomegranate"
+
+files = glob.glob(os.path.join(folder_path, '*.jpg')) + glob.glob(os.path.join(folder_path, '*.JPG'))
+
+for f in files:
+    os.remove(f)
+
+print(f"Removed {len(files)} files from {folder_path}")
+
+************************************************************************************************************************************************
+
+# with tf.GradientTape(persistent=True) as tape:
+            #   fake_img = generator(imgs_lr)
+            #   fake_logits = discriminator(fake_img)
+            #   real_logits = discriminator(imgs_hr)
+            #   fake_feature = vgg(fake_img)
+            #   real_feature = vgg(imgs_hr)
+            #   print("1")
+
+            #   # Discriminator. loss
+            #   d_loss1 = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(fake_logits, tf.zeros_like(fake_logits)))
+            #   d_loss2 = tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(real_logits, tf.ones_like(real_logits)))
+            #   d_loss = d_loss1 + d_loss2
+            #   print("2")
+
+            #   # Generator. loss
+            #   g_gan_loss = 2e-3 * tf.reduce_mean(tf.nn.sigmoid_cross_entropy_with_logits(fake_logits, tf.ones_like(fake_logits)))
+            #   mse_loss   = 2e-1 * tf.reduce_mean(tf.reduce_mean(tf.math.squared_difference(fake_img, imgs_hr), axis=-1))
+            #   vgg_loss   = 2e-6 * tf.reduce_mean(tf.reduce_mean(tf.math.squared_difference(fake_feature, real_feature), axis=-1)) #is used to calculate the mean value of the VGG loss across the batch.
+            #   g_loss = mse_loss + vgg_loss + g_gan_loss
+
+            #   grad = tape.gradient(g_loss, generator.trainable_weights)
+            #   g_optimizer.apply_gradients(zip(grad, generator.trainable_weights))
+            #   print("3")
+
+            #   grad = tape.gradient(d_loss, discriminator.trainable_weights)
+            #   d_optimizer.apply_gradients(zip(grad, discriminator.trainable_weights))
+
+	    # gc.collect()
+            # K.clear_session()
+            # del imgs_hr
+            # del imgs_lr
+            # del fake_hr
+            # del valid
+            # del fake
+            # del d_loss_real
+            # del d_loss_fake
+            # del d_loss
+            # del g_loss
